@@ -1,4 +1,5 @@
 CREATE EXTENSION IF NOT EXISTS hstore;
+CREATE EXTENSION IF NOT EXISTS timescaledb;
 
 DROP TABLE IF EXISTS profile_pprof_samples_cpu;
 
@@ -6,10 +7,11 @@ CREATE TABLE profile_pprof_samples_cpu(
   build_id      TEXT NOT NULL,
   token         TEXT NOT NULL,
   locations     INTEGER[],
-  created_at    TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+  created_at    TIMESTAMPTZ NOT NULL,
   value_cpu     INTEGER,
   value_nanos   INTEGER
 );
+SELECT create_hypertable('profile_pprof_samples_cpu', 'created_at', create_default_indexes=>FALSE);
 
 CREATE INDEX ON profile_pprof_samples_cpu (build_id, token, created_at DESC);
 
