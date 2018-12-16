@@ -133,10 +133,24 @@ func NewProfileStorage(db *sql.DB) *ProfileStorage {
 const (
 	sqlInsertServices = `INSERT INTO services(build_id, token, name, labels) VALUES ($1, $2, $3, $4) ON CONFLICT (build_id, token) DO NOTHING;`
 
-	sqlCreateTempTable = `CREATE TEMPORARY TABLE IF NOT EXISTS profile_pprof_samples_tmp (sample_id INTEGER, location_id INTEGER, func TEXT, file_name TEXT, line INT, build_id TEXT, token TEXT, created_at TIMESTAMP WITHOUT TIME ZONE, value_cpu INTEGER, value_nanos INTEGER) ON COMMIT DELETE ROWS;`
-	sqlInsertLocations = `INSERT INTO profile_pprof_locations (func, file_name, line) SELECT tmp.func, tmp.file_name, tmp.line FROM profile_pprof_samples_tmp AS tmp ON CONFLICT DO NOTHING;`
-	sqlInsertSamples   = `INSERT INTO profile_pprof_samples_cpu (build_id, token, locations, created_at, value_cpu, value_nanos) SELECT build_id, token, array_agg(l.id) as locations, created_at, value_cpu, value_nanos FROM profile_pprof_samples_tmp tmp LEFT JOIN profile_pprof_locations l ON tmp.func = l.func AND tmp.file_name = l.file_name AND tmp.line = l.line GROUP BY sample_id, build_id, token, created_at, value_cpu, value_nanos;`
+	sqlInsertLocations = `
+		INSERT INTO profile_pprof_locations (func, file_name, line) 
+		SELECT tmp.func, tmp.file_name, tmp.line 
+		FROM profile_pprof_samples_tmp AS tmp ON CONFLICT DO NOTHING;`
+	sqlInsertSamples = `
+		INSERT INTO profile_pprof_samples_cpu (build_id, token, locations, created_at, value_cpu, value_nanos)
+		SELECT s.build_id, s.token, t.locations, s.created_at, t.value_cpu, t.value_nanos 
+		FROM (values ($1, $2, $3::timestamp)) as s (build_id, token, created_at),
+	  	(
+			SELECT sample_id, array_agg(l.location_id) as locations, value_cpu, value_nanos
+			FROM profile_pprof_samples_tmp tmp
+			INNER JOIN profile_pprof_locations l ON tmp.func = l.func AND tmp.file_name = l.file_name AND tmp.line = l.line
+			GROUP BY sample_id, value_cpu, value_nanos
+		) as t;`
 )
+
+const sqlCreateTempTable = `CREATE TEMPORARY TABLE IF NOT EXISTS profile_pprof_samples_tmp (sample_id INTEGER, location_id INTEGER, func TEXT, file_name TEXT, line INT, value_cpu INTEGER, value_nanos INTEGER) ON COMMIT DELETE ROWS;`
+var sqlCopyTable = pq.CopyIn("profile_pprof_samples_tmp", "sample_id", "location_id", "func", "file_name", "line", "value_cpu", "value_nanos")
 
 func (s *ProfileStorage) CreateProfile(ctx context.Context, meta map[string]string, filePath string) error {
 	prof, err := s.createProfile(meta, filePath)
@@ -167,7 +181,6 @@ func (s *ProfileStorage) CreateProfile(ctx context.Context, meta map[string]stri
 		return errors.Wrapf(err, "could not create temp table %q", sqlCreateTempTable)
 	}
 
-	sqlCopyTable := pq.CopyIn("profile_pprof_samples_tmp", "sample_id", "location_id", "func", "file_name", "line", "build_id", "token", "created_at", "value_cpu", "value_nanos")
 	copyStmt, err := tx.PrepareContext(ctx, sqlCopyTable)
 	if err != nil {
 		return errors.Wrapf(err, "could not prepare COPY statement %q", sqlCopyTable)
@@ -183,9 +196,6 @@ func (s *ProfileStorage) CreateProfile(ctx context.Context, meta map[string]stri
 					ln.Function.Name,
 					ln.Function.Filename,
 					ln.Line,
-					prof.BuildID,
-					prof.Token,
-					prof.CreatedAt,
 					sample.Value[0],
 					sample.Value[1],
 				)
@@ -206,7 +216,13 @@ func (s *ProfileStorage) CreateProfile(ctx context.Context, meta map[string]stri
 		return errors.Wrap(err, "could not insert locations")
 	}
 
-	_, err = tx.ExecContext(ctx, sqlInsertSamples)
+	_, err = tx.ExecContext(
+		ctx,
+		sqlInsertSamples,
+		prof.BuildID,
+		prof.Token,
+		prof.CreatedAt,
+	)
 	if err != nil {
 		return errors.Wrap(err, "could not insert samples")
 	}
